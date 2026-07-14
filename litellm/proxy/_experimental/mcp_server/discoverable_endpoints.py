@@ -34,6 +34,7 @@ from litellm.proxy._experimental.mcp_server.faults import (
     render_token_fault,
 )
 from litellm.proxy._experimental.mcp_server.gateway_dcr_flow import (
+    ReloadUserFailure,
     aggregate_authorize,
     aggregate_token,
     complete_connect_flow,
@@ -488,7 +489,9 @@ class _ResolvedKey:
     key: "UserAPIKeyAuth"
 
 
-_KeyResolutionFailure = Literal["no_active_key", "unavailable", "unresolvable"]
+# The token endpoint injects `_reload_active_user_by_id` as the flow's `ReloadUser`, so the
+# two must share one failure type; alias the flow's canonical union rather than redeclare it.
+_KeyResolutionFailure = ReloadUserFailure
 """Why a token request yielded no active litellm key, kept distinct so a caller statuses each truthfully
 instead of blaming the client for a gateway problem:
 - ``no_active_key``: none was presented, or the presented key is unknown / blocked / expired (the
@@ -2065,10 +2068,13 @@ async def authorize_complete(request: Request, flow: str = Form(...)):
     route is byte-invisible to existing deployments."""
     if not is_mcp_gateway_dcr_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
-    return complete_connect_flow(
+    from litellm.proxy.proxy_server import user_api_key_cache  # noqa: PLC0415  # circular import at module load
+
+    return await complete_connect_flow(
         request=request,
         flow_handle=flow,
         session_user_id=_session_cookie_user_id(request),
+        cache=user_api_key_cache,
     )
 
 
@@ -2589,11 +2595,19 @@ async def oauth_authorization_server_aggregate(request: Request):
     """
     OAuth authorization server discovery for the aggregate /mcp endpoint, the
     RFC 8414 path-inserted form for a client that treats {base}/mcp as its
-    authorization base URL (gateway-level DCR front door; 404 when the flag
-    is off, indistinguishable from an unknown server name on the
-    parameterized route below).
+    authorization base URL (gateway-level DCR front door).
+
+    This route is registered before the parameterized
+    ``/.well-known/oauth-authorization-server/{mcp_server_name}`` route below and
+    Starlette matches in registration order, so it also captures the request an
+    existing deployment made for a server literally named ``mcp``. With the flag
+    off it therefore falls through to the same per-server builder that route would
+    have called (``mcp_server_name="mcp"``), so a real such server keeps its
+    discovery document and an unknown one 404s with the same body: flag-off stays
+    byte-identical.
     """
-    _raise_404_unless_gateway_dcr_enabled()
+    if not is_mcp_gateway_dcr_enabled():
+        return _build_oauth_authorization_server_response(request=request, mcp_server_name="mcp")
     return _build_aggregate_authorization_server_response(request)
 
 
@@ -2823,7 +2837,7 @@ async def register_client(request: Request, mcp_server_name: Optional[str] = Non
     client_ip = IPAddressUtils.get_mcp_client_ip(request)
     if not mcp_server_name:
         if is_mcp_gateway_dcr_enabled():
-            return await register_aggregate_client(request=request, request_body=data)
+            return await register_aggregate_client(request_body=data)
         resolved = _resolve_oauth2_server_for_root_endpoints(client_ip=client_ip)
         if resolved:
             return await register_client_with_server(

@@ -7227,12 +7227,17 @@ async def test_gateway_dcr_named_discovery_unaffected_by_flag():
 def test_aggregate_wellknown_routes_404_when_flag_off():
     """Flag off, the aggregate well-known routes answer 404 exactly like the
     previously-absent routes: discovery behavior is byte-identical for
-    existing deployments."""
+    existing deployments (no server named ``mcp`` in the registry, so the AS
+    route resolves ``mcp`` as an unknown server and 404s the same way)."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     from litellm.proxy._experimental.mcp_server.discoverable_endpoints import router
+    from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+        global_mcp_server_manager,
+    )
 
+    global_mcp_server_manager.registry.clear()
     app = FastAPI()
     app.include_router(router)
     client = TestClient(app)
@@ -7240,6 +7245,36 @@ def test_aggregate_wellknown_routes_404_when_flag_off():
     with _patch_gateway_dcr_flag(False):
         assert client.get("/.well-known/oauth-protected-resource/mcp").status_code == 404
         assert client.get("/.well-known/oauth-authorization-server/mcp").status_code == 404
+
+
+def test_flag_off_serves_a_real_server_named_mcp_on_the_as_wellknown():
+    """Regression: the aggregate AS route is registered before the parameterized
+    /{mcp_server_name} route it shadows. Flag off, a deployment that has a server
+    literally named ``mcp`` must still get that server's authorization-server
+    document on /.well-known/oauth-authorization-server/mcp (byte-identical to
+    before the aggregate route existed), not a 404."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from litellm.proxy._experimental.mcp_server.discoverable_endpoints import router
+    from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+        global_mcp_server_manager,
+    )
+
+    global_mcp_server_manager.registry.clear()
+    server_named_mcp = _create_oauth2_server(server_id="mcp_srv", name="mcp", server_name="mcp", alias="mcp")
+    global_mcp_server_manager.registry[server_named_mcp.server_id] = server_named_mcp
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+
+    try:
+        with _patch_gateway_dcr_flag(False):
+            response = client.get("/.well-known/oauth-authorization-server/mcp")
+        assert response.status_code == 200
+        assert "/mcp/authorize" in response.json()["authorization_endpoint"]
+    finally:
+        global_mcp_server_manager.registry.clear()
 
 
 def test_aggregate_wellknown_routes_serve_gateway_metadata_when_flag_on():
